@@ -66,15 +66,11 @@ class DockRepository {
     
     /// Update notification badge refresh timer
     @objc private func setupNotificationBadgeRefreshTimer() {
-        /// Get refresh rate
         let refreshRate: NotificationBadgeRefreshRateKeys = Preferences[.notificationBadgeRefreshInterval]
-        /// Invalidate last timer
         self.notificationBadgeRefreshTimer?.invalidate()
-        /// Check if disabled
         guard refreshRate.rawValue >= 0 else {
             return
         }
-        /// Set timer for fetching badges
         self.notificationBadgeRefreshTimer = Timer.scheduledTimer(withTimeInterval: refreshRate.rawValue, repeats: true, block: { [weak self] _ in
             DispatchQueue.main.async { [weak self] in
                 self?.updateNotificationBadges()
@@ -82,8 +78,8 @@ class DockRepository {
         })
     }
 
-    /// Fallback timer to periodically reload dock items on Sonoma where FileMonitor
-    /// may miss dock plist changes due to macOS preference caching changes
+    /// Fallback timer to periodically reload dock items where FileMonitor
+    /// may miss dock plist changes due to macOS preference caching
     private func startDockReloadTimer() {
         dockReloadTimer?.invalidate()
         dockReloadTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
@@ -105,7 +101,6 @@ class DockRepository {
 // MARK: Register/Unregister from event and notifications
 extension DockRepository {
     
-    /// Register for events and notifications
     private func registerForEventsAndNotifications() {
         registerForRunningAppsEvents()
         registerForWorkspaceNotifications()
@@ -113,7 +108,6 @@ extension DockRepository {
         fileMonitor = FileMonitor(paths: [Constants.trashPath, Constants.dockPlist], delegate: self)
     }
     
-    /// Unregister from events and notifications
     private func unregisterFromEventsAndNotifications() {
         fileMonitor = nil
         keyValueObservers.forEach { $0.invalidate() }
@@ -121,7 +115,6 @@ extension DockRepository {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
     
-    // MARK: Events
     private func registerForRunningAppsEvents() {
         self.keyValueObservers = [
             NSWorkspace.shared.observe(\.runningApplications, options: [.old, .new], changeHandler: { [weak self] _, change in
@@ -140,7 +133,6 @@ extension DockRepository {
         ]
     }
     
-    // MARK: Notifications
     private func registerForWorkspaceNotifications() {
         NSWorkspace.shared.notificationCenter.addObserver(self,
                                                           selector: #selector(updateActiveState(_:)),
@@ -164,33 +156,27 @@ extension DockRepository {
 // MARK: Load items
 extension DockRepository {
     
-    /// Reload
     @objc private func reloadDockItems(_ notification: NSNotification?) {
         loadRunningItems()
         loadDefaultItems()
         loadPersistentItems()
     }
     
-    /// Running apps
     @objc private func loadRunningItems() {
         for app in NSWorkspace.shared.runningApplications {
             updateRunningState(for: app)
         }
     }
     
-    /// Defaults
     @objc private func loadDefaultItems() {
-        /// Read data from Dock plist using CFPreferences to bypass cache
         guard let dict = readDockPreferences() else {
             NSLog("[DockWidget]: Can't read Dock preferences file")
             return
         }
-        /// Read persistent apps array
         guard let apps = dict["persistent-apps"] as? [[String: Any]] else {
             NSLog("[DockWidget]: Can't get persistent apps")
             return
         }
-        /// Empty array
         defaultItems.removeAll(where: { item in self.runningItems.contains(where: { $0.bundleIdentifier == item.bundleIdentifier }) == false })
         /// Add Finder item, if needed
         if Preferences[.hideFinder] {
@@ -203,40 +189,58 @@ extension DockRepository {
             defaultItems.insert(item, at: 0)
             dockDelegate?.didUpdateDockItem(item, at: 0, terminated: false, isDefaults: true)
         }
-        /// Only running apps
         guard Preferences[.showOnlyRunningApps] == false else {
             for (index, item) in runningItems.enumerated() {
                 dockDelegate?.didUpdateDockItem(item, at: index, terminated: false, isDefaults: false)
             }
             return
         }
-        /// Iterate on apps
         for (index, app) in apps.enumerated() {
-            /// Get data tile
             guard let dataTile = app["tile-data"] as? [String: Any] else {
                 NSLog("[DockWidget]: Can't get app tile-data")
                 continue
             }
-            /// Get app's label
             guard let label = dataTile["file-label"] as? String else {
                 NSLog("[DockWidget]: Can't get app label")
                 continue
             }
-            /// Get app's bundle identifier
-            guard let bundleIdentifier = dataTile["bundle-identifier"] as? String else {
-                NSLog("[DockWidget]: Can't get app bundle identifier")
+            /// Get file-data for path fallback (used by Wine/Whisky apps without bundle identifier)
+            let fileData = dataTile["file-data"] as? [String: Any]
+            let appPathString = (fileData?["_CFURLString"] as? String)?
+                .replacingOccurrences(of: "file://", with: "")
+                .removingPercentEncoding
+            /// bundle-identifier may be absent for Wine/Whisky wrapper apps
+            let bundleIdentifier = dataTile["bundle-identifier"] as? String
+            /// Skip if neither bundle ID nor path available
+            guard bundleIdentifier != nil || appPathString != nil else {
+                NSLog("[DockWidget]: Skipping item '\(label)' — no bundle identifier or path")
                 continue
             }
-            /// Check if item already exists
-            guard defaultItems.contains(where: { $0.bundleIdentifier == bundleIdentifier }) == false else {
-                continue
+            /// Check if item already exists by bundle ID or path
+            let alreadyExists = defaultItems.contains(where: {
+                if let bid = bundleIdentifier, let existingBid = $0.bundleIdentifier {
+                    return bid == existingBid
+                }
+                if let path = appPathString, let existingPath = $0.path?.path {
+                    return path == existingPath
+                }
+                return false
+            })
+            guard alreadyExists == false else { continue }
+            /// Get icon — prefer bundle ID, fall back to path
+            let icon: NSImage?
+            if let bid = bundleIdentifier {
+                icon = DockRepository.getIcon(forBundleIdentifier: bid)
+            } else {
+                icon = DockRepository.getIcon(orPath: appPathString)
             }
-            /// Create item
+            /// Build path URL for path-based apps (e.g. Wine/Whisky wrappers)
+            let itemPath: URL? = appPathString != nil ? URL(fileURLWithPath: appPathString!) : nil
             let item = DockItem(index + (Preferences[.hideFinder] ? 0 : 1),
                                 bundleIdentifier,
                                 name: label,
-                                path: nil,
-                                icon: DockRepository.getIcon(forBundleIdentifier: bundleIdentifier),
+                                path: itemPath,
+                                icon: icon,
                                 pid_t: 0,
                                 launching: false)
             defaultItems.append(item)
@@ -244,21 +248,16 @@ extension DockRepository {
         }
     }
     
-    /// Load persistent folders and files
     @objc private func loadPersistentItems() {
-        /// Read data from Dock plist using CFPreferences to bypass cache
         guard let dict = readDockPreferences() else {
             NSLog("[DockWidget]: Can't read Dock preferences file")
             return
         }
-        /// Read persistent apps array
         guard let apps = dict["persistent-others"] as? [[String: Any]] else {
             NSLog("[DockWidget]: Can't get persistent apps")
             return
         }
-        /// Temp array
         var tmpPersistentItems: [DockItem] = []
-        /// Iterate on apps
         for (index, app) in apps.enumerated() {
             guard let dataTile = app["tile-data"] as? [String: Any] else { NSLog("[DockWidget]: Can't get file tile-data"); continue }
             guard let label = dataTile["file-label"] as? String else { NSLog("[DockWidget]: Can't get file label"); continue }
@@ -277,7 +276,6 @@ extension DockRepository {
             tmpPersistentItems.append(item)
             dockDelegate?.didUpdatePersistentItem(item, at: index, added: true)
         }
-        /// Remove from current list
         for removedItem in persistentItems.enumerated().filter({ tmpPersistentItems.contains($0.element) == false }) {
             if removedItem.element.name == "Trash" {
                 continue
@@ -285,7 +283,6 @@ extension DockRepository {
             persistentItems.remove(at: removedItem.offset)
             dockDelegate?.didUpdatePersistentItem(removedItem.element, at: removedItem.offset, added: false)
         }
-        /// Handle Trash
         if Preferences[.hideTrash] {
             if let item = persistentItems.first(where: { $0.path?.absoluteString == Constants.trashPath }) {
                 dockDelegate?.didUpdatePersistentItem(item, at: item.index, added: false)
@@ -312,13 +309,10 @@ extension DockRepository {
     
     private var lastValidDockItemsIndex: Int {
         let count = self.dockItems.count
-        guard count > 0 else {
-            return 0
-        }
+        guard count > 0 else { return 0 }
         return count - 1
     }
     
-    /// Create item
     private func createItem(for app: NSRunningApplication) -> DockItem? {
         guard app.activationPolicy == .regular, let id = app.bundleIdentifier, id != Constants.kFinderIdentifier else {
             return nil
@@ -331,15 +325,12 @@ extension DockRepository {
         return DockItem(0, id, name: localizedName, path: bundleURL, icon: icon, pid_t: app.processIdentifier, launching: app.isFinishedLaunching == false)
     }
     
-    /// Update running items
     private func updateRunningState(for app: NSRunningApplication, wasLaunched: Bool = false, wasTerminated: Bool = false) {
         guard app.activationPolicy == .regular else {
             return
         }
         DispatchQueue.main.async { [weak self, app] in
-            guard let self = self else {
-                return
-            }
+            guard let self = self else { return }
             guard let item = self.defaultItems.first(where: { $0.bundleIdentifier == app.bundleIdentifier }) else {
                 guard let runningItem = self.runningItems.enumerated().first(where: { $0.element.bundleIdentifier == app.bundleIdentifier }) else {
                     if let item = self.createItem(for: app) {
@@ -371,12 +362,9 @@ extension DockRepository {
         NSLog("[DockRepositoryEvo]: Update running state for app: [\(app.bundleIdentifier ?? "<unknown-app-\(app)>")]")
     }
     
-    /// Update active state
     @objc private func updateActiveState(_ notification: NSNotification?) {
         DispatchQueue.main.async { [weak self, notification] in
-            guard let self = self else {
-                return
-            }
+            guard let self = self else { return }
             if let app = notification?.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
                 if let result = self.dockItems.enumerated().first(where: { $0.element.bundleIdentifier == app.bundleIdentifier }) {
                     result.element.isLaunching = false
@@ -391,9 +379,7 @@ extension DockRepository {
 // MARK: App icon's badge
 extension DockRepository {
     private func updateNotificationBadges() {
-        guard shouldShowNotificationBadge, let delegate = self.dockDelegate else {
-            return
-        }
+        guard shouldShowNotificationBadge, let delegate = self.dockDelegate else { return }
         for item in dockItems {
             item.badge = PockDockHelper().getBadgeCountForItem(withName: item.name)
         }
@@ -412,14 +398,11 @@ extension DockRepository: FileMonitorDelegate {
 
 // MARK: Get app/file icon
 extension DockRepository {
-    /// Get icon
     public class func getIcon(forBundleIdentifier bundleIdentifier: String? = nil, orPath path: String? = nil, orType type: String? = nil) -> NSImage? {
-        /// Check for bundle identifier first using modern API
         if let bundleIdentifier = bundleIdentifier,
            let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) {
             return NSWorkspace.shared.icon(forFile: appURL.path)
         }
-        /// Then check for path
         if let path = path?.removingPercentEncoding {
             return NSWorkspace.shared.icon(forFile: path)
         }
@@ -434,7 +417,6 @@ extension DockRepository {
         return NSImage(contentsOfFile: genericIconPath) ?? NSImage(size: .zero)
     }
     
-    /// Launch app or open file/directory from bundle identifier
     public func launch(bundleIdentifier: String?, completion: (Bool) -> ()) {
         guard let bundleIdentifier = bundleIdentifier else {
             completion(false)
@@ -459,7 +441,6 @@ extension DockRepository {
                 dockFolderRepository?.push(URL(string: NSHomeDirectory())!)
                 returnable = true
             } else {
-                /// Use modern API to launch app by bundle identifier
                 if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) {
                     let config = NSWorkspace.OpenConfiguration()
                     config.activates = true
@@ -474,11 +455,26 @@ extension DockRepository {
         }
         completion(returnable)
     }
-    
-    /// TO_IMPROVE: If app is already running, do some special things
+
     public func launch(item: DockItem?, completion: (Bool) -> ()) {
-        guard let _item = item, let identifier = _item.bundleIdentifier else {
-            launch(bundleIdentifier: item?.path?.absoluteString, completion: completion)
+        guard let _item = item else {
+            completion(false)
+            return
+        }
+        /// If no bundle identifier (e.g. Wine/Whisky wrapper), launch by path directly
+        guard let identifier = _item.bundleIdentifier else {
+            if let url = _item.path {
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = true
+                NSWorkspace.shared.openApplication(at: url, configuration: config) { _, error in
+                    if let error = error {
+                        NSLog("[DockRepository]: Failed to launch path-based app '\(_item.name)': \(error.localizedDescription)")
+                    }
+                }
+                completion(true)
+            } else {
+                completion(false)
+            }
             return
         }
         let apps = NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
@@ -510,12 +506,15 @@ extension DockRepository {
             return true
         } else {
             if !app.unhide() {
-                /// Use modern API instead of deprecated launchApplication
                 if let bundleId = app.bundleIdentifier,
                    let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
                     let config = NSWorkspace.OpenConfiguration()
                     config.activates = true
                     NSWorkspace.shared.openApplication(at: appURL, configuration: config, completionHandler: nil)
+                } else if let bundleURL = app.bundleURL {
+                    let config = NSWorkspace.OpenConfiguration()
+                    config.activates = true
+                    NSWorkspace.shared.openApplication(at: bundleURL, configuration: config, completionHandler: nil)
                 } else {
                     return app.activate(options: .activateIgnoringOtherApps)
                 }
@@ -525,9 +524,7 @@ extension DockRepository {
     }
     
     private func activateExpose(with windows: [AppExposeItem], app: NSRunningApplication) -> Bool {
-        guard windows.count > 0 else {
-            return false
-        }
+        guard windows.count > 0 else { return false }
         let settings: AppExposeSettings = Preferences[.appExposeSettings]
         guard settings == .always || (settings == .ifNeeded && windows.count > 1) else {
             PockDockHelper().activate(windows.first, in: app)
